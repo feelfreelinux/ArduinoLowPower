@@ -2,6 +2,8 @@
 
 #include "ArduinoLowPower.h"
 
+#if (SAMD21)
+
 static void configGCLK6()
 {
 	// enable EIC clock
@@ -214,5 +216,7 @@ void ADC_Handler()
 }
 
 ArduinoLowPowerClass LowPower;
+
+#endif
 
 #endif // ARDUINO_ARCH_SAMD
