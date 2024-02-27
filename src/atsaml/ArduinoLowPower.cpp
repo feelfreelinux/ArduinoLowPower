@@ -1,3 +1,5 @@
+#define ARDUINO_ARCH_SAMD
+
 #if defined(ARDUINO_ARCH_SAMD)
 #include "ArduinoLowPower.h"
 
@@ -5,10 +7,9 @@
 #include "sam.h"
 
 void ArduinoLowPowerClass::idle() {
-  // SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
-  // PM->SLEEPCFG.reg = PM_SLEEPCFG_SLEEPMODE_IDLE;
-  // __DSB();
-  // __WFI();
+  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
+  __DSB();
+  __WFI();
 }
 
 void ArduinoLowPowerClass::idle(uint32_t millis) {
@@ -17,72 +18,108 @@ void ArduinoLowPowerClass::idle(uint32_t millis) {
 }
 
 void ArduinoLowPowerClass::sleep() {
-  // before modifying the regulator settings, make sure the voltage is stable
-  while (SUPC->INTFLAG.bit.VCORERDY != 1) {
+#ifndef USB_DISABLED
+  if (SERIAL_PORT_USBVIRTUAL) {
+    USBDevice.standby();
+  } else {
+    USBDevice.detach();
+    restoreUSBDevice = true;
   }
-  SUPC->BOD12.bit.ENABLE = 0;
-  SUPC->BOD33.bit.ENABLE = 0;
-
-  // Set standby config
-  PM->STDBYCFG.reg = PM_STDBYCFG_PDCFG(PM_STDBYCFG_PDCFG_DEFAULT_Val) |
-                     (false << PM_STDBYCFG_DPGPD0_Pos) |
-                     (false << PM_STDBYCFG_DPGPD1_Pos) |
-                     PM_STDBYCFG_VREGSMOD(0) |
-                     PM_STDBYCFG_LINKPD(PM_STDBYCFG_LINKPD_DEFAULT_Val) |
-                     PM_STDBYCFG_BBIASHS(false) | PM_STDBYCFG_BBIASLP(false);
-
-  // Prepare OSC16M to 4MHz mode, use for sleep
-  OSCCTRL->OSC16MCTRL.bit.ENABLE = 1;
-  OSCCTRL->OSC16MCTRL.bit.FSEL = OSCCTRL_OSC16MCTRL_FSEL_4_Val;
-  OSCCTRL->OSC16MCTRL.bit.RUNSTDBY = 1;
-  OSCCTRL->OSC16MCTRL.bit.ONDEMAND = 1;
-
-  GCLK_GENCTRL_Type oldGCLKGenCtrl;
-  oldGCLKGenCtrl.reg = 0;
-  oldGCLKGenCtrl.reg = GCLK->GENCTRL[0].reg;
-
-  // Switch to OSC16M
+#endif
   GCLK_GENCTRL_Type gclkConfig;
   gclkConfig.reg = 0;
   gclkConfig.reg = GCLK->GENCTRL[0].reg;
-  gclkConfig.bit.SRC = GCLK_GENCTRL_SRC_OSC16M_Val;
-
+  gclkConfig.bit.SRC =
+      GCLK_GENCTRL_SRC_OSC16M_Val; // GCLK_GENCTRL_SRC_OSCULP32K_Val
+                                   // ;//GCLK_GENCTRL_SRC_OSC16M_Val
   GCLK->GENCTRL[0].reg = gclkConfig.reg;
 
-  // Wait for the clock to switch
-  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_MASK)
-    ;
+  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
+    /* Wait for synchronization */
+  };
+  OSCCTRL->OSC16MCTRL.reg |= OSCCTRL_OSC16MCTRL_ONDEMAND;
 
+  /* Clear performance level status */
   PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
+  /* Switch performance level to PL0 - best power saving */
   PM->PLCFG.reg = PM_PLCFG_PLSEL_PL0_Val;
   while (!PM->INTFLAG.reg) {
     ;
   }
+
+  OSCCTRL_DFLLCTRL_Type dfllCtrlSlp;
+  dfllCtrlSlp.reg = OSCCTRL->DFLLCTRL.reg;
+  dfllCtrlSlp.bit.ENABLE = 0;
+  OSCCTRL->DFLLCTRL.reg = dfllCtrlSlp.reg;
+
+  // disable DFLL GCLK
+  /* Disable the peripheral channel 0 ( DFLL )*/
+  GCLK->PCHCTRL[0].reg &= ~GCLK_PCHCTRL_CHEN;
+
+  while (GCLK->PCHCTRL[0].reg & GCLK_PCHCTRL_CHEN) {
+    /* Wait for clock synchronization */
+  }
+
   // disable xosc32k clock
-  OSC32KCTRL->XOSC32K.bit.ONDEMAND = 0;
   OSC32KCTRL->XOSC32K.reg &= ~OSC32KCTRL_XOSC32K_ENABLE;
-  while ((OSC32KCTRL->STATUS.reg & OSC32KCTRL_STATUS_XOSC32KRDY) == 0)
-    ;
+
+  // disable generator 1
+  GCLK->GENCTRL[1].bit.GENEN = 0;
 
   // Disable systick interrupt:  See
+  // https://www.avrfreaks.net/forum/samd21-samd21e16b-sporadically-locks-and-does-not-wake-standby-sleep-mode
   SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;
+  // set core voltage regulator to "runstandby" - erratta Main Voltage Regulator
+  // Reference:15264
+  // SUPC->VREG.bit.RUNSTDBY = 1;
+  // SUPC->VREG.bit.STDBYPL0 = 1;
 
-  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
-  PM->SLEEPCFG.reg = PM_SLEEPCFG_SLEEPMODE_STANDBY;
+  /* CPU and BUS clocks slow down - slow down busses BEFORE cpu.. */
+  MCLK->BUPDIV.reg =
+      MCLK_BUPDIV_BUPDIV_DIV128; /** Divide Main clock ( 4MHz OSC ) by 64,ie run
+                                    at 31.768kHz */
+  MCLK->LPDIV.reg =
+      MCLK_BUPDIV_BUPDIV_DIV128; /** Divide low power clock ( 4MHz OSC ) by 64,
+                                    ie run at 31.768kHz*/
+  MCLK->CPUDIV.reg = MCLK_CPUDIV_CPUDIV_DIV64; /**(MCLK_CPUDIV) Divide by 64 ,ie
+                                                  run at 62.5kHz */
+
+  SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
   __DSB();
   __WFI();
+  // sleeping here, will wake from here ( except from OFF or Backup modes, those
+  // look like POR )
+
+  /* CPU and BUS clocks back to "regular ratio"*/
+  MCLK->CPUDIV.reg =
+      MCLK_CPUDIV_CPUDIV_DIV1; /**(MCLK_CPUDIV) Divide by 1 ,ie run at 4MHz..
+                                  until we start the DFLL again */
+  MCLK->BUPDIV.reg =
+      MCLK_BUPDIV_BUPDIV_DIV1; /** Div 1, so run these at main clock rate */
+  MCLK->LPDIV.reg =
+      MCLK_BUPDIV_BUPDIV_DIV1; /**low power domain back to CPU clock speed */
 
   // enable xosc32k clock
   OSC32KCTRL->XOSC32K.reg |= OSC32KCTRL_XOSC32K_ENABLE;
-
   // wait for clock to become ready
   while ((OSC32KCTRL->STATUS.reg & OSC32KCTRL_STATUS_XOSC32KRDY) == 0)
     ;
 
-  // Restore GCLK0 to previous state
-  GCLK->GENCTRL[0].reg = oldGCLKGenCtrl.reg;
-  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
+  GCLK->GENCTRL[1].bit.GENEN = 1; // re-enable generator 1 ( xosc32k )
+  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(1)) {
+    /* Wait for synchronization */
   };
+
+  /* Enable DFLL peripheral channel */
+  GCLK->PCHCTRL[0].reg |= GCLK_PCHCTRL_CHEN;
+
+  while (GCLK->PCHCTRL[0].reg & GCLK_PCHCTRL_CHEN) {
+    /* Wait for clock synchronization */
+  }
+
+  // re-enable DFLL
+  dfllCtrlSlp.bit.ENABLE = 1;
+  OSCCTRL->DFLLCTRL.reg = dfllCtrlSlp.reg;
 
   /* Clear performance level status */
   PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
@@ -93,7 +130,27 @@ void ArduinoLowPowerClass::sleep() {
     ;
   }
 
+  OSCCTRL->DFLLCTRL.reg = OSCCTRL_DFLLCTRL_ENABLE;
+
+  gclkConfig.reg = 0;
+  gclkConfig.reg = GCLK->GENCTRL[0].reg;
+  gclkConfig.bit.SRC = GCLK_GENCTRL_SRC_DFLL48M_Val;
+  GCLK->GENCTRL[0].reg = gclkConfig.reg;
+  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
+    /* Wait for synchronization */
+  };
+  //	GCLK->GENCTRL[0].reg |= GCLK_GENCTRL_GENEN;
+  /*  Switch to PL2 to be sure configuration of GCLK0 is safe */
+  // Enable systick interrupt
   SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;
+
+#ifndef USB_DISABLED
+  if (restoreUSBDevice) {
+    delay(1);
+    USBDevice.init();
+    USBDevice.attach();
+  }
+#endif
 }
 
 void ArduinoLowPowerClass::sleep(uint32_t millis) {
@@ -118,7 +175,6 @@ void ArduinoLowPowerClass::setAlarmIn(uint32_t millis) {
 void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin,
                                                  voidFuncPtr callback,
                                                  irq_mode mode) {
-
   if (pin > PINS_COUNT) {
     // check for external wakeup sources
     // RTC library should call this API to enable the alarm subsystem
@@ -131,124 +187,35 @@ void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin,
     return;
   }
 
-  // EExt_Interrupts in = g_APinDescription[pin].ulExtInt;
-  // if (in == NOT_AN_INTERRUPT || in == EXTERNAL_INT_NMI)
-  // 		return;
+  uint8_t in = g_APinDescription[pin].ulExtInt;
+  if (in == NOT_AN_INTERRUPT || in == EXTERNAL_INT_NMI)
+    return;
 
-  // //pinMode(pin, INPUT_PULLUP);
-  // attachInterrupt(pin, callback, mode);
+  // pinMode(pin, INPUT_PULLUP);
+  attachInterrupt(pin, callback, mode);
+#if (SAMD21)
+  configGCLK6();
+#endif
 
-  // configGCLK6();
+#if (SAMD21)
+  // Enable wakeup capability on pin in case being used during sleep
+  EIC->WAKEUP.reg |= (1 << in);
 
-  // // Enable wakeup capability on pin in case being used during sleep
-  // EIC->WAKEUP.reg |= (1 << in);
-}
+#elif (SAML21 || SAMR34)
+  // Enable wakeup capability on pin in case being used during sleep
+  EIC->CTRLA.bit.CKSEL =
+      1; // use ULP32k as source ( SAML21 is different to D21 series, EIC can be
+         // set to use ULP32k without GCLK )
+         // Enable EIC
+  EIC->CTRLA.bit.ENABLE = 1;
+  while (EIC->SYNCBUSY.bit.ENABLE == 1) { /*wait for sync*/
+  }
 
-void ArduinoLowPowerClass::attachAdcInterrupt(uint32_t pin,
-                                              voidFuncPtr callback,
-                                              adc_interrupt mode, uint16_t lo,
-                                              uint16_t hi) {
-  // uint8_t winmode = 0;
-
-  // switch (mode) {
-  // 	case ADC_INT_BETWEEN:   winmode = ADC_WINCTRL_WINMODE_MODE3; break;
-  // 	case ADC_INT_OUTSIDE:   winmode = ADC_WINCTRL_WINMODE_MODE4; break;
-  // 	case ADC_INT_ABOVE_MIN: winmode = ADC_WINCTRL_WINMODE_MODE1; break;
-  // 	case ADC_INT_BELOW_MAX: winmode = ADC_WINCTRL_WINMODE_MODE2; break;
-  // 	default: return;
-  // }
-
-  // adc_cb = callback;
-
-  // configGCLK6();
-
-  // // Configure ADC to use GCLK6 (OSCULP32K)
-  // while (GCLK->STATUS.bit.SYNCBUSY) {}
-  // GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_ADC
-  // 					| GCLK_CLKCTRL_GEN_GCLK6
-  // 					| GCLK_CLKCTRL_CLKEN;
-  // while (GCLK->STATUS.bit.SYNCBUSY) {}
-
-  // // Set ADC prescaler as low as possible
-  // ADC->CTRLB.bit.PRESCALER = ADC_CTRLB_PRESCALER_DIV4;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Configure window mode
-  // ADC->WINLT.reg = lo;
-  // ADC->WINUT.reg = hi;
-  // ADC->WINCTRL.reg = winmode;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Enable window interrupt
-  // ADC->INTENSET.bit.WINMON = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Enable ADC in standby mode
-  // ADC->CTRLA.bit.RUNSTDBY = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Enable continuous conversions
-  // ADC->CTRLB.bit.FREERUN = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Configure input mux
-  // ADC->INPUTCTRL.bit.MUXPOS = g_APinDescription[pin].ulADCChannelNumber;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Enable the ADC
-  // ADC->CTRLA.bit.ENABLE = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Start continuous conversions
-  // ADC->SWTRIG.bit.START = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Enable the ADC interrupt
-  // NVIC_EnableIRQ(ADC_IRQn);
-}
-
-void ArduinoLowPowerClass::detachAdcInterrupt() {
-  // // Disable the ADC interrupt
-  // NVIC_DisableIRQ(ADC_IRQn);
-
-  // // Disable the ADC
-  // ADC->CTRLA.bit.ENABLE = 0;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Disable continuous conversions
-  // ADC->CTRLB.bit.FREERUN = 0;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Disable ADC in standby mode
-  // ADC->CTRLA.bit.RUNSTDBY = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Disable window interrupt
-  // ADC->INTENCLR.bit.WINMON = 1;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Disable window mode
-  // ADC->WINCTRL.reg = ADC_WINCTRL_WINMODE_DISABLE;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Restore ADC prescaler
-  // ADC->CTRLB.bit.PRESCALER = ADC_CTRLB_PRESCALER_DIV512_Val;
-  // while (ADC->STATUS.bit.SYNCBUSY) {}
-
-  // // Restore ADC clock
-  // while (GCLK->STATUS.bit.SYNCBUSY) {}
-  // GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_ADC
-  // 					| GCLK_CLKCTRL_GEN_GCLK0
-  // 					| GCLK_CLKCTRL_CLKEN;
-  // while (GCLK->STATUS.bit.SYNCBUSY) {}
-
-  // adc_cb = nullptr;
-}
-
-void ADC_Handler() {
-  // // Clear the interrupt flag
-  // ADC->INTFLAG.bit.WINMON = 1;
-  // LowPower.adc_cb();
+  /* Errata: Make sure that the Flash does not power all the way down
+   * when in sleep mode. */
+  // NVMCTRL->CTRLB.bit.SLEEPPRM = NVMCTRL_CTRLB_SLEEPPRM_DISABLED_Val;
+  NVMCTRL->CTRLB.bit.SLEEPPRM = NVMCTRL_CTRLB_SLEEPPRM_WAKEUPINSTANT_Val;
+#endif
 }
 
 ArduinoLowPowerClass LowPower;

@@ -92,6 +92,7 @@ class ArduinoLowPowerClass {
 	private:
 		void setAlarmIn(uint32_t millis);
 		#ifdef ARDUINO_ARCH_SAMD
+		bool restoreUSBDevice = false;
 		RTCZero rtc;
 		voidFuncPtr adc_cb;
 		friend void ADC_Handler();
