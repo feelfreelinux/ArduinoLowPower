@@ -27,6 +27,15 @@ void ArduinoLowPowerClass::sleep() {
   }
 #endif
   GCLK_GENCTRL_Type gclkConfig;
+  OSCCTRL->OSC16MCTRL.bit.ENABLE = 0;
+  OSCCTRL->OSC16MCTRL.bit.FSEL = OSCCTRL_OSC16MCTRL_FSEL_4_Val;
+  OSCCTRL->OSC16MCTRL.bit.RUNSTDBY = 1;
+  OSCCTRL->OSC16MCTRL.bit.ONDEMAND = 0;
+
+  OSCCTRL->OSC16MCTRL.reg |= OSCCTRL_OSC16MCTRL_ENABLE;
+
+  while((OSCCTRL->STATUS.reg & OSCCTRL_STATUS_OSC16MRDY) == 0);
+
   gclkConfig.reg = 0;
   gclkConfig.reg = GCLK->GENCTRL[0].reg;
   gclkConfig.bit.SRC =
@@ -37,15 +46,8 @@ void ArduinoLowPowerClass::sleep() {
   while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
     /* Wait for synchronization */
   };
-  OSCCTRL->OSC16MCTRL.reg |= OSCCTRL_OSC16MCTRL_ONDEMAND;
 
-  /* Clear performance level status */
-  PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
-  /* Switch performance level to PL0 - best power saving */
-  PM->PLCFG.reg = PM_PLCFG_PLSEL_PL0_Val;
-  while (!PM->INTFLAG.reg) {
-    ;
-  }
+	OSCCTRL->OSC16MCTRL.reg |= OSCCTRL_OSC16MCTRL_ONDEMAND;
 
   OSCCTRL_DFLLCTRL_Type dfllCtrlSlp;
   dfllCtrlSlp.reg = OSCCTRL->DFLLCTRL.reg;
@@ -59,51 +61,89 @@ void ArduinoLowPowerClass::sleep() {
   while (GCLK->PCHCTRL[0].reg & GCLK_PCHCTRL_CHEN) {
     /* Wait for clock synchronization */
   }
-
-  // disable xosc32k clock
-  OSC32KCTRL->XOSC32K.reg &= ~OSC32KCTRL_XOSC32K_ENABLE;
-
+  
   // disable generator 1
   GCLK->GENCTRL[1].bit.GENEN = 0;
+
+
+  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(1)) {
+    /* Wait for synchronization */
+  };
+
+  /* Clear performance level status */
+  PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
+  /* Switch performance level to PL0 - best power saving */
+  PM->PLCFG.reg = PM_PLCFG_PLSEL_PL0_Val;
+  while (!PM->INTFLAG.reg) {
+    ;
+  }
+
+  OSC32KCTRL->XOSC32K.bit.ONDEMAND = 0;
+  OSC32KCTRL->XOSC32K.reg &= ~OSC32KCTRL_XOSC32K_ENABLE;
+  while ((OSC32KCTRL->STATUS.reg & OSC32KCTRL_STATUS_XOSC32KRDY) == 0);
+
+    // Set standby config
+  PM->STDBYCFG.reg = PM_STDBYCFG_PDCFG(PM_STDBYCFG_PDCFG_DEFAULT_Val) |
+                     (false << PM_STDBYCFG_DPGPD0_Pos) |
+                     (false << PM_STDBYCFG_DPGPD1_Pos) |
+                     PM_STDBYCFG_VREGSMOD(0) |
+                     PM_STDBYCFG_LINKPD(PM_STDBYCFG_LINKPD_DEFAULT_Val) |
+                     PM_STDBYCFG_BBIASHS(false) | PM_STDBYCFG_BBIASLP(false);
 
   // Disable systick interrupt:  See
   // https://www.avrfreaks.net/forum/samd21-samd21e16b-sporadically-locks-and-does-not-wake-standby-sleep-mode
   SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;
-  // set core voltage regulator to "runstandby" - erratta Main Voltage Regulator
-  // Reference:15264
-  // SUPC->VREG.bit.RUNSTDBY = 1;
-  // SUPC->VREG.bit.STDBYPL0 = 1;
 
   /* CPU and BUS clocks slow down - slow down busses BEFORE cpu.. */
   MCLK->BUPDIV.reg =
       MCLK_BUPDIV_BUPDIV_DIV128; /** Divide Main clock ( 4MHz OSC ) by 64,ie run
                                     at 31.768kHz */
   MCLK->LPDIV.reg =
-      MCLK_BUPDIV_BUPDIV_DIV128; /** Divide low power clock ( 4MHz OSC ) by 64,
+      MCLK_LPDIV_LPDIV_DIV128; /** Divide low power clock ( 4MHz OSC ) by 64,
                                     ie run at 31.768kHz*/
   MCLK->CPUDIV.reg = MCLK_CPUDIV_CPUDIV_DIV64; /**(MCLK_CPUDIV) Divide by 64 ,ie
                                                   run at 62.5kHz */
 
-  SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+	PM->SLEEPCFG.reg = PM_SLEEPCFG_SLEEPMODE_STANDBY;
+	while(PM->SLEEPCFG.reg != PM_SLEEPCFG_SLEEPMODE_STANDBY) ;
+
+  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
   __DSB();
   __WFI();
   // sleeping here, will wake from here ( except from OFF or Backup modes, those
   // look like POR )
 
-  /* CPU and BUS clocks back to "regular ratio"*/
+  // /* CPU and BUS clocks back to "regular ratio"*/
   MCLK->CPUDIV.reg =
       MCLK_CPUDIV_CPUDIV_DIV1; /**(MCLK_CPUDIV) Divide by 1 ,ie run at 4MHz..
                                   until we start the DFLL again */
   MCLK->BUPDIV.reg =
       MCLK_BUPDIV_BUPDIV_DIV1; /** Div 1, so run these at main clock rate */
   MCLK->LPDIV.reg =
-      MCLK_BUPDIV_BUPDIV_DIV1; /**low power domain back to CPU clock speed */
+      MCLK_LPDIV_LPDIV_DIV1; /**low power domain back to CPU clock speed */
+
+  /* Clear performance level status */
+  PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
+  /* Switch performance level to PL2 - Highest performance */
+  PM->PLCFG.reg = PM_PLCFG_PLSEL_PL2_Val;
+  /* Waiting performance level ready */
+  while (!PM->INTFLAG.reg) {
+    ;
+  }
 
   // enable xosc32k clock
   OSC32KCTRL->XOSC32K.reg |= OSC32KCTRL_XOSC32K_ENABLE;
   // wait for clock to become ready
   while ((OSC32KCTRL->STATUS.reg & OSC32KCTRL_STATUS_XOSC32KRDY) == 0)
     ;
+
+  gclkConfig.reg = 0;
+  gclkConfig.reg = GCLK->GENCTRL[0].reg;
+  gclkConfig.bit.SRC = GCLK_GENCTRL_SRC_XOSC32K_Val;
+  GCLK->GENCTRL[0].reg = gclkConfig.reg;
+  while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
+    /* Wait for synchronization */
+  };
 
   GCLK->GENCTRL[1].bit.GENEN = 1; // re-enable generator 1 ( xosc32k )
   while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(1)) {
@@ -121,16 +161,10 @@ void ArduinoLowPowerClass::sleep() {
   dfllCtrlSlp.bit.ENABLE = 1;
   OSCCTRL->DFLLCTRL.reg = dfllCtrlSlp.reg;
 
-  /* Clear performance level status */
-  PM->INTFLAG.reg = PM_INTFLAG_PLRDY;
-  /* Switch performance level to PL2 - Highest performance */
-  PM->PLCFG.reg = PM_PLCFG_PLSEL_PL2_Val;
-  /* Waiting performance level ready */
-  while (!PM->INTFLAG.reg) {
-    ;
-  }
-
   OSCCTRL->DFLLCTRL.reg = OSCCTRL_DFLLCTRL_ENABLE;
+
+  while ((OSCCTRL->STATUS.reg & OSCCTRL_STATUS_DFLLRDY) == 0)
+    ;
 
   gclkConfig.reg = 0;
   gclkConfig.reg = GCLK->GENCTRL[0].reg;
@@ -139,8 +173,9 @@ void ArduinoLowPowerClass::sleep() {
   while (GCLK->SYNCBUSY.reg & GCLK_SYNCBUSY_GENCTRL(0)) {
     /* Wait for synchronization */
   };
-  //	GCLK->GENCTRL[0].reg |= GCLK_GENCTRL_GENEN;
-  /*  Switch to PL2 to be sure configuration of GCLK0 is safe */
+
+	OSCCTRL->OSC16MCTRL.reg &= ~OSCCTRL_OSC16MCTRL_ENABLE;
+  
   // Enable systick interrupt
   SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;
 
@@ -191,7 +226,6 @@ void ArduinoLowPowerClass::attachInterruptWakeup(uint32_t pin,
   if (in == NOT_AN_INTERRUPT || in == EXTERNAL_INT_NMI)
     return;
 
-  // pinMode(pin, INPUT_PULLUP);
   attachInterrupt(pin, callback, mode);
 #if (SAMD21)
   configGCLK6();
