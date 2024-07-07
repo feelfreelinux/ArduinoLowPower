@@ -1,5 +1,3 @@
-#define ARDUINO_ARCH_SAMD
-
 #if defined(ARDUINO_ARCH_SAMD)
 #include "ArduinoLowPower.h"
 
